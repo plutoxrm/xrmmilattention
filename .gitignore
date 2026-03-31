@@ -1,0 +1,14 @@
+# Python缓存
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 你的数据/输出
+encoder_features/
+outputs/
+
+# 可选（推荐）
+*.log
+*.tmp
