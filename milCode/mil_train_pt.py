@@ -1,144 +1,157 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class AttentionMILPool(nn.Module):
-    def __init__(self, in_dim: int, d_hidden: int = 64, dropout: float = 0.3):
+    """
+    Standard Attention MIL with optional padding mask.
+
+    Input:
+        feats: [B, N, D]
+        mask:  [B, N], bool
+               True  -> real instance
+               False -> padding
+    Output:
+        pooled: [B, D]
+        attn:   [B, N]
+    """
+    def __init__(self, in_dim: int, d_hidden: int = 128, dropout: float = 0.0):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, d_hidden)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.fc2 = nn.Linear(d_hidden, 1)
 
-    def forward(self, feats):
-        h = torch.tanh(self.fc1(feats))
-        #h = self.dropout(h)
-        logits = self.fc2(h).squeeze(-1)
-        attn = torch.softmax(logits, dim=1)
-        pooled = torch.bmm(attn.unsqueeze(1), feats).squeeze(1)
+    def forward(self, feats, mask=None):
+        h = torch.tanh(self.fc1(feats))      # [B, N, H]
+        h = self.dropout(h)
+        logits = self.fc2(h).squeeze(-1)     # [B, N]
+
+        if mask is not None:
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+
+            # 避免全 padding 的非法情况
+            if (~mask).all(dim=1).any():
+                raise ValueError("Found a bag with all positions masked out.")
+
+            logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+
+        attn = torch.softmax(logits, dim=1)  # [B, N]
+
+        # 数值安全：把 padding 位清零并重新归一化
+        if mask is not None:
+            attn = attn * mask.float()
+            attn = attn / attn.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+        pooled = torch.bmm(attn.unsqueeze(1), feats).squeeze(1)  # [B, D]
         return pooled, attn
 
 
-
-class GatedAttentionMILPool(nn.Module):
-    def __init__(self, in_dim: int, d_hidden: int = 128, dropout: float = 0.2):
+class LinearClassifierHead(nn.Module):
+    """
+    Attention + Linear
+    """
+    def __init__(self, in_dim: int, n_labels: int):
         super().__init__()
-        self.attention_V = nn.Sequential(
-            nn.Linear(in_dim, d_hidden),
-            nn.Tanh()
-        )
-        self.attention_U = nn.Sequential(
-            nn.Linear(in_dim, d_hidden),
-            nn.Sigmoid()
-        )
-        self.attention_weights = nn.Linear(d_hidden, 1)
-    
-    def forward(self, feats):
-        A_V = self.attention_V(feats)
-        A_U = self.attention_U(feats)
-        A = self.attention_weights(A_V * A_U).squeeze(-1)
-        attn = torch.softmax(A, dim=1)
-        pooled = torch.bmm(attn.unsqueeze(1), feats).squeeze(1)
-        return pooled, attn
+        self.net = nn.Linear(in_dim, n_labels)
+
+    def forward(self, x):
+        return self.net(x)
 
 
-class DSMILPool(nn.Module):
-    def __init__(self, in_dim: int, d_hidden: int = 256, dropout: float = 0.2):
+class MLPClassifierHead(nn.Module):
+    """
+    Attention + MLP
+    """
+    def __init__(self, in_dim: int, n_labels: int, hidden_dim: int = 256):
         super().__init__()
-        
-        self.instance_fc = nn.Sequential(
-            nn.Linear(in_dim, d_hidden),
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Linear(hidden_dim, n_labels),
         )
-        
-        self.instance_attention = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden // 2),
-            nn.Tanh(),
-            nn.Linear(d_hidden // 2, 1)
-        )
-        
-        self.bag_fc = nn.Sequential(
-            nn.Linear(in_dim, d_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-    
-    def forward(self, feats):
-        h_instance = self.instance_fc(feats)
-        attn = self.instance_attention(h_instance)
-        attn = torch.softmax(attn, dim=1)
-        z_instance = (h_instance * attn).sum(dim=1)
-        
-        h_bag = self.bag_fc(feats)
-        z_bag = h_bag.max(dim=1)[0]
-        
-        pooled = torch.cat([z_instance, z_bag], dim=1)
-        return pooled, attn
+
+    def forward(self, x):
+        return self.net(x)
 
 
-class TransformerMILPool(nn.Module):
-    def __init__(self, in_dim: int, d_hidden: int = 256, n_heads: int = 4, n_layers: int = 2, dropout: float = 0.2):
+class MLPLNDropoutClassifierHead(nn.Module):
+    """
+    Attention + MLP + LayerNorm + Dropout
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        n_labels: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ):
         super().__init__()
-        
-        self.feat_proj = nn.Sequential(
-            nn.Linear(in_dim, d_hidden),
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_labels),
         )
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_hidden,
-            nhead=n_heads,
-            dim_feedforward=d_hidden * 2,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-    
-    def forward(self, feats):
-        x = self.feat_proj(feats)
-        x = self.transformer(x)
-        pooled = x.mean(dim=1)
-        return pooled, None
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class PatientMILFeatures(nn.Module):
-    def __init__(self, in_dim: int = 768, n_labels: int = 1, d_hidden_attn: int = 128, dropout: float = 0.3,
-                 architecture: str = 'attention'):
+    """
+    只保留 Attention MIL，并支持 3 种分类头：
+        1) linear
+        2) mlp
+        3) mlp_ln_dropout
+    """
+    def __init__(
+        self,
+        in_dim: int = 768,
+        n_labels: int = 1,
+        d_hidden_attn: int = 128,
+        architecture: str = "attention",
+        classifier_type: str = "linear",
+        classifier_hidden_dim: int = 256,
+        classifier_dropout: float = 0.3,
+        attn_dropout: float = 0.0,
+    ):
         super().__init__()
-        
-        if architecture == 'attention':
-            self.pool = AttentionMILPool(in_dim, d_hidden_attn, dropout=0.2)
-            classifier_in_dim = in_dim
-        elif architecture == 'gated':
-            self.pool = GatedAttentionMILPool(in_dim, d_hidden_attn, dropout=0.2)
-            classifier_in_dim = in_dim
-        elif architecture == 'dsmil':
-            self.pool = DSMILPool(in_dim, d_hidden=256, dropout=0.2)
-            classifier_in_dim = 512
-        elif architecture == 'transmil':
-            self.pool = TransformerMILPool(in_dim, d_hidden=256, n_heads=4, n_layers=2, dropout=0.2)
-            classifier_in_dim = 256
-        else:
-            raise ValueError(f"Unknown architecture: {architecture}")
-        '''
-        self.classifier = nn.Sequential(
-            nn.Linear(classifier_in_dim, 256),
-            nn.ReLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, n_labels)
-        )
-        '''
-        
-        self.classifier = nn.Linear(classifier_in_dim, n_labels)
 
-    
-    def forward(self, feats):
-        pooled, attn = self.pool(feats)
+        if architecture != "attention":
+            raise ValueError(
+                f"Only 'attention' is supported now, but got architecture={architecture}"
+            )
+
+        self.pool = AttentionMILPool(
+            in_dim=in_dim,
+            d_hidden=d_hidden_attn,
+            dropout=attn_dropout,
+        )
+
+        if classifier_type == "linear":
+            self.classifier = LinearClassifierHead(in_dim=in_dim, n_labels=n_labels)
+        elif classifier_type == "mlp":
+            self.classifier = MLPClassifierHead(
+                in_dim=in_dim,
+                n_labels=n_labels,
+                hidden_dim=classifier_hidden_dim,
+            )
+        elif classifier_type == "mlp_ln_dropout":
+            self.classifier = MLPLNDropoutClassifierHead(
+                in_dim=in_dim,
+                n_labels=n_labels,
+                hidden_dim=classifier_hidden_dim,
+                dropout=classifier_dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unknown classifier_type: {classifier_type}. "
+                f"Choose from ['linear', 'mlp', 'mlp_ln_dropout']"
+            )
+
+    def forward(self, feats, mask=None):
+        pooled, attn = self.pool(feats, mask=mask)
         logits = self.classifier(pooled)
         return logits, pooled, attn
-
-
-
-
