@@ -1,0 +1,15 @@
+查看历史版本
+git log --oneline
+切换到某个版本（不会破坏历史）
+git checkout e4f5g6h
+从这个版本创建新分支（重点！）
+git checkout -b new-branch
+修改代码 + 提交
+git add .
+git commit -m "在旧版本基础上修改"
+推送到远程
+git push origin new-branch
+
+
+确认你在新分支上
+git branch

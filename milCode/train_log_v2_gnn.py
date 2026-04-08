@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore", message="Input data has no positive sample")
 
 from dataset_patient_pt import PatientFeatureDataset
-from mil_train_pt import PatientMILFeatures
+from mil_train_pt_gnn import PatientMILFeatures
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from libauc.losses import AUCMLoss
 
@@ -240,7 +240,12 @@ def main():
     parser.add_argument("--valid_max_feats", type=int, default=-1)
     parser.add_argument("--valid_instance_strategy", type=str, default="all")
 
-    parser.add_argument("--architecture", type=str, default="attention", choices=["attention"])
+    parser.add_argument(
+        "--architecture",
+        type=str,
+        default="attention",
+        choices=["attention", "graph_attention"],
+    )
     parser.add_argument(
         "--classifier_type",
         type=str,
@@ -251,6 +256,19 @@ def main():
     parser.add_argument("--classifier_dropout", type=float, default=0.3)
     parser.add_argument("--attn_hidden_dim", type=int, default=128)
     parser.add_argument("--attn_dropout", type=float, default=0.0)
+
+    parser.add_argument("--graph_hidden_dim", type=int, default=0)
+    parser.add_argument("--graph_num_layers", type=int, default=2)
+    parser.add_argument("--graph_topk", type=int, default=8)
+    parser.add_argument(
+        "--graph_similarity",
+        type=str,
+        default="cosine",
+        choices=["cosine", "rbf"],
+    )
+    parser.add_argument("--graph_sigma", type=float, default=1.0)
+    parser.add_argument("--graph_dropout", type=float, default=0.1)
+    parser.add_argument("--graph_residual", action="store_true")
 
     parser.add_argument("--threshold_metric", type=str, default="youden", choices=["youden", "f1"])
     parser.add_argument("--use_combined_loss", action="store_true")
@@ -358,6 +376,13 @@ def main():
             classifier_hidden_dim=args.classifier_hidden_dim,
             classifier_dropout=args.classifier_dropout,
             attn_dropout=args.attn_dropout,
+            graph_hidden_dim=args.graph_hidden_dim,
+            graph_num_layers=args.graph_num_layers,
+            graph_topk=args.graph_topk,
+            graph_similarity=args.graph_similarity,
+            graph_sigma=args.graph_sigma,
+            graph_dropout=args.graph_dropout,
+            graph_residual=args.graph_residual,
         ).to(device)
 
         pos_weight = compute_pos_weight(train_df[args.label_cols].values.astype("float32")).to(device)
@@ -496,63 +521,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-"""
-Attention + Linear
-python train_log_v2.py ^
-  --feat_dir ./encoder_features ^
-  --labels_csv ./labels03.xlsx ^
-  --label_cols "代谢慢病" ^
-  --architecture attention ^
-  --classifier_type linear ^
-  --epochs 70 ^
-  --batch_size 4 ^
-  --lr 5e-4 ^
-  --weight_decay 1e-4 ^
-  --folds 5 ^
-  --train_max_feats 16 ^
-  --train_instance_strategy random ^
-  --valid_max_feats -1 ^
-  --valid_instance_strategy all ^
-  --use_combined_loss ^
-  --auc_weight 0.5
-
-Attention + MLP
-python train_log_v2.py ^
-  --feat_dir ./encoder_features ^
-  --labels_csv ./labels03.xlsx ^
-  --label_cols "代谢慢病" ^
-  --architecture attention ^
-  --classifier_type mlp ^
-  --epochs 70 ^
-  --batch_size 4 ^
-  --lr 5e-4 ^
-  --weight_decay 1e-4 ^
-  --folds 5 ^
-  --train_max_feats 16 ^
-  --train_instance_strategy random ^
-  --valid_max_feats -1 ^
-  --valid_instance_strategy all ^
-  --use_combined_loss ^
-  --auc_weight 0.5
-
-Attention + MLP + LN + Dropout
-python train_log_v2.py ^
-  --feat_dir ./encoder_features ^
-  --labels_csv ./labels03.xlsx ^
-  --label_cols "代谢慢病" ^
-  --architecture attention ^
-  --classifier_type mlp_ln_dropout ^
-  --epochs 70 ^
-  --batch_size 4 ^
-  --lr 5e-4 ^
-  --weight_decay 1e-4 ^
-  --folds 5 ^
-  --train_max_feats 16 ^
-  --train_instance_strategy random ^
-  --valid_max_feats -1 ^
-  --valid_instance_strategy all ^
-  --use_combined_loss ^
-  --auc_weight 0.5
-"""
