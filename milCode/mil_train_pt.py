@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class AttentionMILPool(nn.Module):
@@ -15,6 +16,7 @@ class AttentionMILPool(nn.Module):
         pooled: [B, D]
         attn:   [B, N]
     """
+
     def __init__(self, in_dim: int, d_hidden: int = 128, dropout: float = 0.0):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, d_hidden)
@@ -30,7 +32,6 @@ class AttentionMILPool(nn.Module):
             if mask.dtype != torch.bool:
                 mask = mask.bool()
 
-            # 避免全 padding 的非法情况
             if (~mask).all(dim=1).any():
                 raise ValueError("Found a bag with all positions masked out.")
 
@@ -38,7 +39,6 @@ class AttentionMILPool(nn.Module):
 
         attn = torch.softmax(logits, dim=1)  # [B, N]
 
-        # 数值安全：把 padding 位清零并重新归一化
         if mask is not None:
             attn = attn * mask.float()
             attn = attn / attn.sum(dim=1, keepdim=True).clamp_min(1e-12)
@@ -48,9 +48,6 @@ class AttentionMILPool(nn.Module):
 
 
 class LinearClassifierHead(nn.Module):
-    """
-    Attention + Linear
-    """
     def __init__(self, in_dim: int, n_labels: int):
         super().__init__()
         self.net = nn.Linear(in_dim, n_labels)
@@ -60,9 +57,6 @@ class LinearClassifierHead(nn.Module):
 
 
 class MLPClassifierHead(nn.Module):
-    """
-    Attention + MLP
-    """
     def __init__(self, in_dim: int, n_labels: int, hidden_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
@@ -76,9 +70,6 @@ class MLPClassifierHead(nn.Module):
 
 
 class MLPLNDropoutClassifierHead(nn.Module):
-    """
-    Attention + MLP + LayerNorm + Dropout
-    """
     def __init__(
         self,
         in_dim: int,
@@ -101,11 +92,17 @@ class MLPLNDropoutClassifierHead(nn.Module):
 
 class PatientMILFeatures(nn.Module):
     """
-    只保留 Attention MIL，并支持 3 种分类头：
-        1) linear
-        2) mlp
-        3) mlp_ln_dropout
+    Attention MIL + prototype auxiliary branch
+
+    主干:
+        feats -> attention pooling -> pooled -> classifier -> logits
+
+    prototype 分支:
+        feats -> proto_proj -> instance embedding z
+             -> 与正/负 prototypes 求 cosine similarity
+             -> 返回 s_pos / s_neg / margin
     """
+
     def __init__(
         self,
         in_dim: int = 768,
@@ -116,6 +113,11 @@ class PatientMILFeatures(nn.Module):
         classifier_hidden_dim: int = 256,
         classifier_dropout: float = 0.3,
         attn_dropout: float = 0.0,
+        use_prototype: bool = True,
+        proto_dim: int = 128,
+        num_pos_prototypes: int = 4,
+        num_neg_prototypes: int = 4,
+        proto_temperature: float = 0.1,
     ):
         super().__init__()
 
@@ -151,7 +153,84 @@ class PatientMILFeatures(nn.Module):
                 f"Choose from ['linear', 'mlp', 'mlp_ln_dropout']"
             )
 
+        self.use_prototype = use_prototype
+        self.proto_temperature = proto_temperature
+
+        if self.use_prototype:
+            self.proto_proj = nn.Sequential(
+                nn.Linear(in_dim, proto_dim),
+                nn.ReLU(),
+                nn.LayerNorm(proto_dim),
+            )
+
+            self.pos_prototypes = nn.Parameter(
+                torch.randn(num_pos_prototypes, proto_dim)
+            )
+            self.neg_prototypes = nn.Parameter(
+                torch.randn(num_neg_prototypes, proto_dim)
+            )
+
+            self._init_prototype_branch()
+
+    def _init_prototype_branch(self):
+        for m in self.proto_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+        nn.init.normal_(self.pos_prototypes, mean=0.0, std=0.02)
+        nn.init.normal_(self.neg_prototypes, mean=0.0, std=0.02)
+
+    def _compute_prototype_scores(self, feats, mask=None):
+        """
+        feats: [B, N, D]
+        return:
+            z:       [B, N, P]
+            s_pos:   [B, N]
+            s_neg:   [B, N]
+            margin:  [B, N] = s_pos - s_neg
+        """
+        z = self.proto_proj(feats)                       # [B, N, P]
+        z_norm = F.normalize(z, p=2, dim=-1)
+
+        pos_proto = F.normalize(self.pos_prototypes, p=2, dim=-1)  # [Kp, P]
+        neg_proto = F.normalize(self.neg_prototypes, p=2, dim=-1)  # [Kn, P]
+
+        sim_pos = torch.einsum("bnp,kp->bnk", z_norm, pos_proto) / self.proto_temperature
+        sim_neg = torch.einsum("bnp,kp->bnk", z_norm, neg_proto) / self.proto_temperature
+
+        s_pos, _ = sim_pos.max(dim=-1)   # [B, N]
+        s_neg, _ = sim_neg.max(dim=-1)   # [B, N]
+        margin = s_pos - s_neg           # [B, N]
+
+        if mask is not None:
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            s_pos = s_pos.masked_fill(~mask, 0.0)
+            s_neg = s_neg.masked_fill(~mask, 0.0)
+            margin = margin.masked_fill(~mask, 0.0)
+            z = z.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+        return z, s_pos, s_neg, margin
+
     def forward(self, feats, mask=None):
         pooled, attn = self.pool(feats, mask=mask)
         logits = self.classifier(pooled)
-        return logits, pooled, attn
+
+        out = {
+            "logits": logits,
+            "pooled": pooled,
+            "attn": attn,
+            "inst_embed": None,
+            "s_pos": None,
+            "s_neg": None,
+            "margin": None,
+        }
+
+        if self.use_prototype:
+            z, s_pos, s_neg, margin = self._compute_prototype_scores(feats, mask=mask)
+            out["inst_embed"] = z
+            out["s_pos"] = s_pos
+            out["s_neg"] = s_neg
+            out["margin"] = margin
+
+        return out
